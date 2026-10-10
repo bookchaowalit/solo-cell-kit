@@ -19,7 +19,7 @@ resources:
       closed_at: {type: timestamp}
       tags: {type: json, json: array}
       settings: {type: json, json: object}
-      parent_id: {type: ref, to: board, on_delete: set_null}
+      parent_id: {type: ref, to: board}
       external_project_id: {type: bigint}
   card:
     table: cards

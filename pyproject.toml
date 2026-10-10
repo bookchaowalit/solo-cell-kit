@@ -17,6 +17,7 @@ dev = ["pytest>=8", "pgserver>=0.1.4"]
 
 [project.scripts]
 cellkit-new = "cellkit.new:main"
+cellkit-import = "cellkit.importer:main"
 
 [build-system]
 requires = ["setuptools>=69"]

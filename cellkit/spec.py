@@ -22,7 +22,7 @@ Example::
         fields:
           title: {type: text, required: true, max_length: 500}
           status: {type: enum, values: [planning, active], default: planning}
-          parent_id: {type: ref, to: goal, on_delete: set_null}
+          parent_id: {type: ref, to: goal}
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ import yaml
 KEBAB = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
 SNAKE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 TYPES = {"text", "int", "bigint", "real", "bool", "date", "timestamp", "json", "enum", "ref"}
-RESERVED = {"id", "workspace_id", "legacy_id", "version", "created_at", "updated_at", "expected_version"}
+RESERVED = {"id", "workspace_id", "legacy_id", "version", "created_at", "updated_at", "expected_version", "deleted"}
 LEGACY_LIMIT = 1_000_000  # imported rows keep their old id; new rows start above it
 
 
@@ -55,8 +55,7 @@ class Field:
     min: float | None = None
     max: float | None = None
     max_length: int | None = None
-    to: str | None = None  # ref target resource (same cell)
-    on_delete: str = "cascade"  # ref: cascade | set_null | restrict
+    to: str | None = None  # ref target resource (same cell); deleting a referenced row is refused (409)
     json_kind: str | None = None  # json: array | object
     unique: bool = False
 
@@ -75,6 +74,11 @@ class Resource:
     graph: tuple[str, ...] | None = None  # payload fields; None = no graph events
     unique: tuple[tuple[str, ...], ...] = ()
     order: str = "id"
+    # Import from the old SQLite table (cellkit-import): source table, the column that is the old id,
+    # and value rewrites per field ({field: {old: new}}).
+    legacy_table: str | None = None
+    legacy_id_from: str = "id"
+    legacy_values: tuple[tuple[str, tuple[tuple[Any, Any], ...]], ...] = ()
 
     def field(self, name: str) -> Field:
         for f in self.fields:
@@ -161,20 +165,24 @@ def _field(name: str, raw: dict[str, Any], resource: str) -> Field:
         raise SpecError(f"{resource}.{name}: enum needs values")
     if kind == "ref" and not raw.get("to"):
         raise SpecError(f"{resource}.{name}: ref needs 'to'")
-    on_delete = raw.get("on_delete", "cascade")
-    if on_delete not in ("cascade", "set_null", "restrict"):
-        raise SpecError(f"{resource}.{name}: on_delete must be cascade, set_null or restrict")
-    if on_delete == "set_null" and raw.get("required"):
-        raise SpecError(f"{resource}.{name}: a required ref cannot be set_null")
+    for bound in ("min", "max"):
+        if raw.get(bound) is not None and (isinstance(raw[bound], bool) or not isinstance(raw[bound], (int, float))):
+            raise SpecError(f"{resource}.{name}: {bound} must be a number")
+    if raw.get("max_length") is not None and (isinstance(raw["max_length"], bool)
+                                              or not isinstance(raw["max_length"], int)):
+        raise SpecError(f"{resource}.{name}: max_length must be an integer")
+    if raw.get("json") not in (None, "array", "object"):
+        raise SpecError(f"{resource}.{name}: json must be array or object")
+    if "on_delete" in raw:
+        raise SpecError(f"{resource}.{name}: refs are always restrict (delete the referencing rows first)")
     if raw.get("default") is not None and kind == "enum" and raw["default"] not in values:
         raise SpecError(f"{resource}.{name}: default not in values")
-    unknown = set(raw) - {"type", "required", "default", "values", "min", "max", "max_length", "to", "on_delete",
-                          "json", "unique"}
+    unknown = set(raw) - {"type", "required", "default", "values", "min", "max", "max_length", "to", "json", "unique"}
     if unknown:
         raise SpecError(f"{resource}.{name}: unknown keys {sorted(unknown)}")
     return Field(name=name, type=kind, required=bool(raw.get("required")), default=raw.get("default"),
                  values=values, min=raw.get("min"), max=raw.get("max"), max_length=raw.get("max_length"),
-                 to=raw.get("to"), on_delete=on_delete, json_kind=raw.get("json"), unique=bool(raw.get("unique")))
+                 to=raw.get("to"), json_kind=raw.get("json"), unique=bool(raw.get("unique")))
 
 
 def parse(data: dict[str, Any], root: Path = Path(".")) -> Cell:
@@ -199,12 +207,25 @@ def parse(data: dict[str, Any], root: Path = Path(".")) -> Cell:
         for listed in (*filters, *(graph or ()), *(c for u in unique for c in u)):
             if listed not in names:
                 raise SpecError(f"{rname}: {listed!r} is not a field")
+        unknown = set(raw) - {"table", "plural", "fields", "filters", "graph", "unique", "order", "legacy_table",
+                              "legacy_id_from", "legacy_values"}
+        if unknown:
+            raise SpecError(f"{rname}: unknown keys {sorted(unknown)}")
+        legacy_values = tuple((name, tuple((raw_old, raw_new) for raw_old, raw_new in mapping.items()))
+                              for name, mapping in (raw.get("legacy_values") or {}).items())
+        for name, _ in legacy_values:
+            if name not in names:
+                raise SpecError(f"{rname}: legacy_values names unknown field {name!r}")
         resources.append(Resource(name=rname, table=table, plural=plural, fields=fields, filters=filters,
                                   graph=tuple(graph) if graph is not None else None, unique=unique,
-                                  order=raw.get("order", "id")))
+                                  order=raw.get("order", "id"), legacy_table=raw.get("legacy_table"),
+                                  legacy_id_from=raw.get("legacy_id_from", "id"), legacy_values=legacy_values))
     if not resources:
         raise SpecError("a cell needs at least one resource")
-    cell = Cell(name=name, title=data.get("title", name), resources=tuple(resources), port=int(data.get("port", 3700)),
+    title = str(data.get("title", name))
+    if not re.fullmatch(r"[^\x00-\x1f\x7f]{1,100}", title):
+        raise SpecError("title must be one line of printable text")
+    cell = Cell(name=name, title=title, resources=tuple(resources), port=int(data.get("port", 3700)),
                 extend=data.get("extend"), root=root)
     known = {r.name for r in resources}
     for r in resources:

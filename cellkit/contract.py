@@ -16,7 +16,7 @@ from cellkit.publisher import publish_pending
 from cellkit.spec import LEGACY_LIMIT, Cell, Resource
 from cellkit.testing import body, sample
 
-__all__ = ["test_lifecycle", "test_authorization", "test_workspace_isolation", "test_idempotent_create",
+__all__ = ["test_lifecycle", "test_executions_are_bound_to_the_record", "test_no_reference_across_workspaces", "test_authorization", "test_workspace_isolation", "test_idempotent_create",
            "test_import_keeps_the_old_id", "test_validation", "test_version_conflict", "test_missing_reference",
            "test_publisher_delivers_the_outbox", "pytest_generate_tests"]
 
@@ -79,6 +79,31 @@ def test_lifecycle(client, owner, harness, resource):
         types = harness.superuser(f"SELECT type FROM {cell.schema}.outbox WHERE subject = %s ORDER BY occurred_at",
                                   (f"empire:{cell.name}:{r.name}:{record['id']}",))
         assert types[0][0] == f"{cell.name}.{r.name}.created" and types[-1][0] == f"{cell.name}.{r.name}.deleted"
+
+
+def test_executions_are_bound_to_the_record(client, owner, harness, platform, resource):
+    cell, r = harness.cell, resource
+    record = make(client, owner, cell, r)
+    client.patch(f"/v1/{r.plural}/{record['id']}", headers=owner, json={})
+    client.delete(f"/v1/{r.plural}/{record['id']}", headers=owner)
+    bound = [(e["permission"], e["bound_to"], e.get("resource_id")) for e in platform.executions.values()
+             if e.get("resource_id") == str(record["id"]) and e.get("resource_type") == r.name]
+    assert {p.rsplit(":", 1)[1] for p, _, _ in bound} >= {"write", "delete"}
+    assert all(bound_to == str(record["id"]) == audited for _, bound_to, audited in bound)
+
+
+def test_no_reference_across_workspaces(client, owner, harness, platform, resource):
+    cell, r = harness.cell, resource
+    refs = [f for f in r.refs if f.to != r.name]
+    if not refs:
+        pytest.skip("no refs to other resources")
+    target = make(client, owner, cell, cell.resource(refs[0].to))
+    other_actor = uuid.uuid4()
+    platform.grants[other_actor] = set(cell.permissions())
+    other = harness.token(other_actor, uuid.uuid4())
+    own = {f.to: make(client, other, cell, cell.resource(f.to))["id"] for f in r.refs if f.required}
+    payload = {**body(r, own), refs[0].name: target["id"]}
+    assert client.post(f"/v1/{r.plural}", headers=other, json=payload).status_code == 422
 
 
 def test_authorization(client, owner, harness, platform, resource):

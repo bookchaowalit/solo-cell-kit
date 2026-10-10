@@ -63,7 +63,8 @@ class FakePlatform:
             if not self.decide(token, channel, Action(needed, action.resource_type, action.resource_id)):
                 raise Denied(403, "deny", "no_permission")
         execution = uuid.uuid4()
-        self.executions[execution] = {"permission": action.action, "status": "running", "actor": self._actor(token)}
+        self.executions[execution] = {"permission": action.action, "bound_to": action.resource_id, "status": "running",
+                                      "actor": self._actor(token)}
         if idempotency_key:
             self.keys[idempotency_key] = execution
         return execution, False, "running"

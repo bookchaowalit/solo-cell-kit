@@ -17,13 +17,50 @@ def board(client, owner, **extra):
     return response.json()
 
 
-def test_set_null_and_cascade_refs(client, owner):
+def test_a_referenced_row_cannot_be_deleted(client, owner):
     parent = board(client, owner)
     child = board(client, owner, parent_id=parent["id"])
     card = client.post("/v1/cards", headers=owner, json={"board_id": parent["id"], "slug": "c1"}).json()
+    refused = client.delete(f"/v1/boards/{parent['id']}", headers=owner)
+    assert refused.status_code == 409 and refused.json()["detail"]["error"] == "has_dependents"
+    assert client.delete(f"/v1/cards/{card['id']}", headers=owner).status_code == 204
+    assert client.patch(f"/v1/boards/{child['id']}", headers=owner, json={"parent_id": None}).status_code == 200
     assert client.delete(f"/v1/boards/{parent['id']}", headers=owner).status_code == 204
-    assert client.get(f"/v1/boards/{child['id']}", headers=owner).json()["parent_id"] is None
-    assert client.get(f"/v1/cards/{card['id']}", headers=owner).status_code == 404
+
+
+def test_json_type_changes_are_changes(client, owner):
+    b = board(client, owner, settings={"flag": True})
+    changed = client.patch(f"/v1/boards/{b['id']}", headers=owner, json={"settings": {"flag": 1}}).json()
+    assert changed["settings"] == {"flag": 1} and changed["version"] == 2
+
+
+def test_no_reservation_without_write_permission(harness, client, platform):
+    import uuid as _uuid
+    reader = _uuid.uuid4()
+    platform.grants[reader] = {f"{harness.cell.name}.board:read"}
+    headers = {**harness.token(reader, _uuid.uuid4()), "Idempotency-Key": f"k-{_uuid.uuid4().hex}"}
+    before = harness.superuser(f"SELECT count(*) FROM {harness.cell.schema}.create_keys")[0][0]
+    assert client.post("/v1/boards", headers=headers, json={"title": "x"}).status_code == 403
+    assert harness.superuser(f"SELECT count(*) FROM {harness.cell.schema}.create_keys")[0][0] == before
+
+
+def test_replay_after_delete_does_not_resurrect(client, owner):
+    import uuid as _uuid
+    key = {"Idempotency-Key": f"k-{_uuid.uuid4().hex}"}
+    first = client.post("/v1/boards", headers={**owner, **key}, json={"title": "once"}).json()
+    assert client.delete(f"/v1/boards/{first['id']}", headers=owner).status_code == 204
+    again = client.post("/v1/boards", headers={**owner, **key}, json={"title": "once"})
+    assert again.status_code == 409 and client.get(f"/v1/boards/{first['id']}", headers=owner).status_code == 404
+
+
+def test_same_legacy_id_in_two_workspaces(harness, client, platform, owner):
+    import uuid as _uuid
+    other_actor = _uuid.uuid4()
+    platform.grants[other_actor] = set(harness.cell.permissions())
+    other = harness.token(other_actor, _uuid.uuid4())
+    for headers in (owner, other):
+        response = client.post("/v1/boards", headers=headers, json={"title": "imported", "legacy_id": 424242})
+        assert response.status_code == 201 and response.json()["id"] == 424242
 
 
 def test_paging_order_null_filter_and_json(client, owner):

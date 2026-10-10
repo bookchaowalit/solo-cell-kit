@@ -85,7 +85,10 @@ def models(r: Resource) -> tuple[type[BaseModel], type[BaseModel]]:
     """(create model, update model): unknown fields are refused; required fields must be given on create."""
     config = ConfigDict(extra="forbid")
     create_fields: dict[str, Any] = {
-        "legacy_id": (int | None, PydanticField(default=None, gt=0, lt=LEGACY_LIMIT))}
+        "legacy_id": (int | None, PydanticField(default=None, gt=0, lt=LEGACY_LIMIT)),
+        # Only an import (legacy_id) may carry the old timestamps.
+        "created_at": (datetime | None, PydanticField(default=None)),
+        "updated_at": (datetime | None, PydanticField(default=None))}
     update_fields: dict[str, Any] = {"expected_version": (int | None, PydanticField(default=None, ge=1))}
     for f in r.fields:
         typ, extra = _python_type(f), _constraints(f)
@@ -148,6 +151,9 @@ class Plan:
     resource_id: str
     audit: dict[str, Any]
     result: Any
+    # False when the result is a row this attempt inserted: a replay of a finished operation must not
+    # return it (the insert is rolled back; the original row may have been deleted since).
+    replay_safe: bool = True
 
 
 @dataclass
@@ -244,6 +250,8 @@ def create_app(cell: Cell, connect: Callable[[], psycopg.Connection], verifier: 
                     raise HTTPException(status_code=503, detail={"error": "authorization_unavailable"}) from exc
                 if replayed and status == "succeeded":
                     conn.rollback()
+                    if not plan.replay_safe:
+                        raise HTTPException(status_code=409, detail={"error": "replayed_record_gone"})
                     return plan.result
                 if replayed and status != "running":
                     raise HTTPException(status_code=409, detail={"error": "replayed", "status": status})
@@ -253,6 +261,8 @@ def create_app(cell: Cell, connect: Callable[[], psycopg.Connection], verifier: 
             except psycopg.errors.UniqueViolation as exc:
                 raise HTTPException(status_code=409, detail={"error": "conflict"}) from exc
             except psycopg.errors.ForeignKeyViolation as exc:
+                if (exc.diag.message_primary or "").startswith("update or delete on table"):
+                    raise HTTPException(status_code=409, detail={"error": "has_dependents"}) from exc
                 raise HTTPException(status_code=422, detail={"error": "reference_not_found"}) from exc
             except (psycopg.errors.NotNullViolation, psycopg.errors.CheckViolation) as exc:
                 raise HTTPException(status_code=422, detail={"error": "invalid_value"}) from exc
@@ -272,10 +282,10 @@ def create_app(cell: Cell, connect: Callable[[], psycopg.Connection], verifier: 
     def emit(work: Work, r: Resource, verb: str, before: dict | None, after: dict | None) -> dict[str, Any]:
         current = after or before or {}
         if r.graph is not None:
-            payload: dict[str, Any] = {"version": current.get("version", 0) + (1 if after is None else 0),
-                                       "deleted": after is None}
+            payload: dict[str, Any] = {}
             if after is not None:
                 payload.update({name: after.get(name) for name in r.graph})
+            payload.update(version=current.get("version", 0) + (1 if after is None else 0), deleted=after is None)
             work.conn.execute(
                 f"INSERT INTO {schema}.outbox (workspace_id, type, subject, execution_id, classification, payload,"
                 " correlation_id) VALUES (%s, %s, %s, %s, 'confidential', %s, %s)",
@@ -352,8 +362,13 @@ def create_app(cell: Cell, connect: Callable[[], psycopg.Connection], verifier: 
     def stored(r: Resource, data: dict[str, Any]) -> dict[str, Any]:
         return {k: (Jsonb(v) if r.field(k).type == "json" and v is not None else v) for k, v in data.items()}
 
-    def changed(before: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
-        return {name: value for name, value in data.items() if before.get(name) != value}
+    def changed(r: Resource, before: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        def same(name: str, value: Any) -> bool:
+            if r.field(name).type == "json":  # true and 1 are equal in Python, not in JSON
+                return json.dumps(before.get(name), sort_keys=True) == json.dumps(value, sort_keys=True)
+            return before.get(name) == value
+
+        return {name: value for name, value in data.items() if not same(name, value)}
 
     def register(r: Resource) -> None:
         create_body, update_body = models(r)
@@ -373,7 +388,9 @@ def create_app(cell: Cell, connect: Callable[[], psycopg.Connection], verifier: 
             if query.get("after_id"):
                 clauses.append("id < %s" if direction == "DESC" else "id > %s")
                 params.append(coerce(None, query["after_id"], "after_id"))
-            sort = f"{r.order} {direction}, id {direction}" if r.order != "id" else f"id {direction}"
+            # A cursor (after_id) pages by id; otherwise the resource's own order, then id.
+            sort = f"{r.order} {direction}, id {direction}" if r.order != "id" and not query.get("after_id") \
+                else f"id {direction}"
             with bound(caller) as conn:
                 rows = conn.execute(f"SELECT {r.select} FROM {table} WHERE {' AND '.join(clauses)}"
                                     f" ORDER BY {sort} LIMIT %s OFFSET %s", [*params, limit, offset]).fetchall()
@@ -410,6 +427,11 @@ def create_app(cell: Cell, connect: Callable[[], psycopg.Connection], verifier: 
         def create(body: create_body, caller: Caller, background: BackgroundTasks,  # type: ignore[valid-type]
                    idempotency_key: Annotated[str | None, Header()] = None):
             data = {k: v for k, v in values(r, body, body.model_fields_set).items() if v is not None}
+            stamps = {k: getattr(body, k) for k in ("created_at", "updated_at") if getattr(body, k) is not None}
+            if stamps and body.legacy_id is None:
+                raise HTTPException(status_code=422, detail={"error": "invalid_value", "fields": sorted(stamps)})
+            # Authorize before reserving anything (a reservation is a committed row).
+            allow(caller, f"{cell.name}.{r.name}:write", r.name, "new")
             # An import keeps its old id (legacy_id); a retried import then conflicts instead of duplicating.
             reserved = reserve(caller, r, idempotency_key) if idempotency_key and body.legacy_id is None else None
 
@@ -425,6 +447,9 @@ def create_app(cell: Cell, connect: Callable[[], psycopg.Connection], verifier: 
                 if body.legacy_id is not None:
                     columns.append("legacy_id")
                     params.append(body.legacy_id)
+                    for name, value in stamps.items():
+                        columns.append(name)
+                        params.append(value)
                 record_id = body.legacy_id if body.legacy_id is not None else reserved
                 if record_id is not None:
                     columns.append("id")
@@ -432,7 +457,8 @@ def create_app(cell: Cell, connect: Callable[[], psycopg.Connection], verifier: 
                 row = work.conn.execute(
                     f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(['%s'] * len(columns))})"
                     f" RETURNING {r.select}", params).fetchone()
-                return Plan(f"{cell.name}.{r.name}:write", str(row["id"]), emit(work, r, "created", None, row), row)
+                return Plan(f"{cell.name}.{r.name}:write", str(row["id"]), emit(work, r, "created", None, row), row,
+                            replay_safe=False)
 
             row = write(caller, r.name, op, precheck=(f"{cell.name}.{r.name}:write", "new"),
                         idempotency_key=idempotency_key)
@@ -449,7 +475,7 @@ def create_app(cell: Cell, connect: Callable[[], psycopg.Connection], verifier: 
                 if body.expected_version is not None and before["version"] != body.expected_version:
                     raise HTTPException(status_code=409, detail={"error": "version_conflict",
                                                                  "version": before["version"]})
-                data = changed(before, requested)
+                data = changed(r, before, requested)
                 if not data:
                     return Plan(f"{cell.name}.{r.name}:write", str(record_id),
                                 audit(r, "unchanged", record_id, before, before), before)
