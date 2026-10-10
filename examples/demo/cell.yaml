@@ -1,0 +1,33 @@
+# A small cell that exercises every field type, refs (cascade, set_null, self), json and graph events.
+cell: demo-things
+title: Demo things
+resources:
+  board:
+    table: boards
+    plural: boards
+    graph: [title, status]
+    filters: [status, kind]
+    order: title
+    fields:
+      title: {type: text, required: true, max_length: 200}
+      status: {type: enum, values: [planning, active, done], default: planning}
+      kind: {type: enum, values: [a, b]}
+      priority: {type: int, default: 3, min: 0, max: 10}
+      score: {type: real, min: 0}
+      archived: {type: bool, default: false}
+      due_date: {type: date}
+      closed_at: {type: timestamp}
+      tags: {type: json, json: array}
+      settings: {type: json, json: object}
+      parent_id: {type: ref, to: board, on_delete: set_null}
+      external_project_id: {type: bigint}
+  card:
+    table: cards
+    plural: cards
+    filters: [board_id, done]
+    unique: [[board_id, slug]]
+    fields:
+      board_id: {type: ref, to: board, required: true}
+      slug: {type: text, required: true, max_length: 100}
+      done: {type: bool, default: false}
+      note: {type: text}
