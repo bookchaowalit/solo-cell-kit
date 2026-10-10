@@ -74,6 +74,8 @@ RAILWAY = """import {{ defineRailway, project, service }} from "railway/iac";
 
 // solo-{name}: the {title} cell. Variables stay unmanaged (secrets live in Railway only).
 // {name}-api sleeps when idle (Railway Serverless) and wakes on the next request.{publisher_note}
+// Every service runs in Singapore next to Neon (aws-ap-southeast-1) and empire-platform; the IaC does not
+// carry the region, so after the first deploy: railway scale --service <svc> asia-southeast1-eqsg3a=1 us-east4-eqdc4a=0
 export default defineRailway(() => {{
   const api = service("{name}-api", {{
     healthcheck: "/health",
@@ -179,6 +181,7 @@ uv venv .venv && uv pip install --python .venv/bin/python -e ".[dev]"
 .venv/bin/pytest -q
 NEON_API_KEY=... .venv/bin/{cell.name}-db provision
 npm install && railway config apply && railway up --ci --service {cell.name}-api
+railway scale --service {cell.name}-api asia-southeast1-eqsg3a=1 us-east4-eqdc4a=0   # next to Neon and the platform
 ```
 
 Railway variables: `{env}_DB_MODE=hosted`, `{env}_DB_URL_API`,
