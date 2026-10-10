@@ -213,9 +213,9 @@ def parse(data: dict[str, Any], root: Path = Path(".")) -> Cell:
             raise SpecError(f"{rname}: unknown keys {sorted(unknown)}")
         legacy_values = tuple((name, tuple((raw_old, raw_new) for raw_old, raw_new in mapping.items()))
                               for name, mapping in (raw.get("legacy_values") or {}).items())
-        for name, _ in legacy_values:
-            if name not in names:
-                raise SpecError(f"{rname}: legacy_values names unknown field {name!r}")
+        for field_name, _ in legacy_values:
+            if field_name not in names:
+                raise SpecError(f"{rname}: legacy_values names unknown field {field_name!r}")
         resources.append(Resource(name=rname, table=table, plural=plural, fields=fields, filters=filters,
                                   graph=tuple(graph) if graph is not None else None, unique=unique,
                                   order=raw.get("order", "id"), legacy_table=raw.get("legacy_table"),

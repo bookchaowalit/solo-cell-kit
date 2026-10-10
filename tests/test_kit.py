@@ -122,3 +122,9 @@ def test_extend_hook_adds_routes(harness, platform, owner, monkeypatch):
 def test_bad_specs_are_refused(bad):
     with pytest.raises(SpecError):
         parse(bad)
+
+
+def test_resource_options_never_rename_the_cell():
+    cell = parse({"cell": "goals", "resources": {"a": {"legacy_values": {"x": {"low": 3}},
+                                                       "fields": {"x": {"type": "int"}}}}})
+    assert cell.name == "goals" and cell.schema == "goals"
