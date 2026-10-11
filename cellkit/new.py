@@ -30,7 +30,8 @@ dependencies = [
     "psycopg[binary]>=3.2,<4",
     "fastapi>=0.115,<1",
     "pyjwt[crypto]>=2.10,<3",
-    "uvicorn>=0.30,<1",
+    # [standard] = uvloop + httptools: +82% RPS in polyglot-benchmark-lab, and avoids the h11 Nagle stall
+    "uvicorn[standard]>=0.30,<1",
     "httpx>=0.27,<1",
     "pyyaml>=6,<7",
 ]
@@ -55,7 +56,7 @@ testpaths = ["tests"]
 addopts = "-ra"
 """
 
-DOCKERFILE = """FROM python:3.12-slim
+DOCKERFILE = """FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 CELL_APP_ROOT=/app
 WORKDIR /app
