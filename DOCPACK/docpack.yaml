@@ -1,0 +1,8 @@
+system_id: bookchaowalit/private/solo-cell-kit
+prefix: CARD
+brand: "CELL KIT"
+subtitle: "ตัวสร้าง cell ของ Solo Empire จาก `cell.yaml`"
+footer: "solo-cell-kit — Product Card"
+color: "#023047"
+audience: internal
+tier: L0
