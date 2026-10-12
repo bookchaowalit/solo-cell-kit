@@ -1,5 +1,11 @@
 # solo-cell-kit
 
+> **Retired 2026-10-12.** Each cell repository now owns the code that this kit once generated
+> (`src/cellkit/` in solo-goals, solo-projects, solo-roles-skills and the others). There is no
+> sync step any more: change a cell's code in that cell's repository. This repository is archived
+> for reference only.
+
+
 Make a Solo Empire cell from a `cell.yaml`: its own repository, HTTP API,
 PostgreSQL schema (Neon), platform write path, graph outbox, deploy files and
 contract tests. Every cell made with the kit follows the same rules as the
