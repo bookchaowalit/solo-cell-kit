@@ -30,8 +30,10 @@ from __future__ import annotations
 import contextvars
 import inspect
 import os
+import re
 import urllib.parse
 import uuid
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -48,6 +50,14 @@ OPERATIONS = ("list", "get", "create", "update", "delete")
 READ_ONLY = ("list", "get")
 LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 MAX_LIMIT = 200
+# Names that would let a caller choose who it acts as; never exposed as tool arguments, even if a resource has them.
+IDENTITY_NAMES = frozenset({"actor", "actor_id", "workspace", "workspace_id", "tenant", "tenant_id", "delegation",
+                            "token", "authorization", "owner_id"})
+IDEMPOTENCY_KEY = r"^[A-Za-z0-9._:-]{8,128}$"
+AUTOMATION = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+# Tool errors carry the HTTP status and one of these fixed words, never upstream text.
+STATUS_WORDS = {400: "invalid", 401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict",
+                412: "conflict", 422: "invalid", 429: "rate_limited"}
 
 
 # The arguments exactly as the caller sent them: the framework fills defaults, but "unset" and "null" differ.
@@ -96,8 +106,15 @@ def api_url(cell: str, environ: Any = None) -> str:
     value = (environ.get(key) or "").strip() or _client_file(environ).get(key, "")
     if not value:
         raise ConfigError(f"the {cell} API is not configured: set {key} (env or client.env)")
-    parts = urllib.parse.urlsplit(value)
-    host = (parts.hostname or "").lower()
+    try:
+        parts = urllib.parse.urlsplit(value)
+        host = (parts.hostname or "").lower()
+        parts.port  # noqa: B018 - raises ValueError on a bad port
+    except ValueError:
+        raise ConfigError(f"{key} is not a valid URL") from None
+    if parts.username is not None or parts.password is not None or parts.query or parts.fragment or "?" in value \
+            or "#" in value or "@" in parts.netloc:
+        raise ConfigError(f"{key} must not carry userinfo, a query or a fragment")
     if not (parts.scheme == "https" and host) and not (parts.scheme == "http" and host in LOOPBACK):
         raise ConfigError(f"{key} must be https (http only for 127.0.0.1, ::1 or localhost)")
     return value
@@ -109,20 +126,29 @@ def _read_token_file(path: Path) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
+def _checked(token: str) -> str:
+    token = token.strip()
+    if not token or re.search(r"[\s\x00-\x1f\x7f]", token) or not token.isascii():
+        raise ConfigError("the token is empty or contains whitespace, control or non-ASCII characters")
+    return token
+
+
 def bearer(environ: Any = None) -> str:
     """The caller's own token: EMPIRE_TOKEN, EMPIRE_TOKEN_FILE, else the named automation token."""
     environ = os.environ if environ is None else environ
     if environ.get("EMPIRE_TOKEN"):
-        return environ["EMPIRE_TOKEN"].strip()
+        return _checked(environ["EMPIRE_TOKEN"])
     if environ.get("EMPIRE_TOKEN_FILE"):
-        return _read_token_file(Path(environ["EMPIRE_TOKEN_FILE"]).expanduser())
+        return _checked(_read_token_file(Path(environ["EMPIRE_TOKEN_FILE"]).expanduser()))
     name = environ.get("EMPIRE_MCP_AUTOMATION") or "owner-cli"
+    if not AUTOMATION.match(name):
+        raise ConfigError("EMPIRE_MCP_AUTOMATION must be a short lowercase name (letters, digits, '-')")
     key = "EMPIRE_AUTOMATION_TOKEN_" + name.upper().replace("-", "_")
     if environ.get(key):
-        return environ[key].strip()
+        return _checked(environ[key])
     path = Path.home() / ".config" / "empire-platform" / "tokens" / f"{name}.jwt"
     if path.is_file():
-        return _read_token_file(path)
+        return _checked(_read_token_file(path))
     raise ConfigError(f"no token: set EMPIRE_TOKEN, EMPIRE_TOKEN_FILE or {key}")
 
 
@@ -133,6 +159,11 @@ def argument_models(cell: Cell, r: Resource) -> dict[str, type[Strict]]:
     name = "".join(part.title() for part in r.name.split("-"))
     cfg = {"__base__": Strict}
 
+    exposed = tuple(f for f in r.fields if f.name not in IDENTITY_NAMES)
+    for f in r.fields:
+        if f.name in IDENTITY_NAMES:
+            warnings.warn(f"{cell.name}.{r.name}.{f.name}: identity-like field is not exposed through MCP", stacklevel=2)
+
     def typed(f, *, required: bool):
         typ, extra = _python_type(f), _constraints(f)
         if required:
@@ -140,7 +171,7 @@ def argument_models(cell: Cell, r: Resource) -> dict[str, type[Strict]]:
         return (typ | None, PydanticField(default=None, **extra))
 
     list_fields: dict[str, Any] = {
-        **{f.name: typed(f, required=False) for f in r.fields if f.name in r.filters and f.name not in ("limit", "offset", "order")},
+        **{f.name: typed(f, required=False) for f in exposed if f.name in r.filters and f.name not in ("limit", "offset", "order")},
         "limit": (int, PydanticField(default=50, ge=1, le=MAX_LIMIT)),
         "offset": (int, PydanticField(default=0, ge=0)),
         "order": (Literal["asc", "desc"], PydanticField(default="asc")),
@@ -150,10 +181,11 @@ def argument_models(cell: Cell, r: Resource) -> dict[str, type[Strict]]:
         "list": create_model(f"{name}List", **cfg, **list_fields),
         "get": create_model(f"{name}Ref", **cfg, **ident),
         "create": create_model(f"{name}Create", **cfg, **{
-            f.name: typed(f, required=f.required and f.default is None) for f in r.fields}),
+            f.name: typed(f, required=f.required and f.default is None) for f in exposed},
+                             idempotency_key=(str | None, PydanticField(default=None, pattern=IDEMPOTENCY_KEY))),
         "update": create_model(f"{name}Update", **cfg, **ident,
                                expected_version=(int | None, PydanticField(default=None, ge=1)),
-                               **{f.name: typed(f, required=False) for f in r.fields}),
+                               **{f.name: typed(f, required=False) for f in exposed}),
         "delete": create_model(f"{name}Delete", **cfg, **ident),
     }
 
@@ -207,6 +239,14 @@ def _with_signature(function: Callable[..., Any], model: type[Strict]) -> Callab
     return function
 
 
+def _no_preparse(server: MCPServer, name: str) -> None:
+    """The framework json.loads strings for non-str parameters ("{}" in a text field); the strict model already
+    validated the exact arguments, so skip the guess (best effort: relies on mcp 2.3 internals)."""
+    tool = server._tool_manager.get_tool(name)
+    if tool is not None:
+        object.__setattr__(tool.fn_metadata, "pre_parse_json", lambda data: data)
+
+
 def build_server(cell: Cell, client: httpx.Client, token: Callable[[], str], *, read_only: bool = False,
                  server: StrictMCPServer | None = None) -> StrictMCPServer:
     """Register ``<cell>.<resource>.<operation>`` tools; ``client`` is the cell API (base_url set)."""
@@ -215,14 +255,20 @@ def build_server(cell: Cell, client: httpx.Client, token: Callable[[], str], *, 
             f"Solo Empire {cell.title} cell. Every tool calls the cell API as the authenticated caller only."))
 
     def call(method: str, path: str, **kwargs: Any) -> Any:
-        headers = {"Authorization": f"Bearer {token()}", "X-Empire-Channel": "mcp",
+        try:
+            bearer_token = _checked(token())
+        except ConfigError as exc:
+            raise ToolFailed(str(exc)) from None
+        headers = {"Authorization": f"Bearer {bearer_token}", "X-Empire-Channel": "mcp",
                    "X-Correlation-Id": f"mcp-{uuid.uuid4().hex}", **kwargs.pop("headers", {})}
-        response = client.request(method, path, headers=headers, **kwargs)
+        try:
+            response = client.request(method, path, headers=headers, **kwargs)
+        except httpx.HTTPError:
+            raise ToolFailed("unavailable: the cell API could not be reached") from None
         if response.status_code >= 400:
-            detail = response.json().get("detail") if response.headers.get(
-                "content-type", "").startswith("application/json") else None
-            reason = (detail.get("reason") or detail.get("error")) if isinstance(detail, dict) else "error"
-            raise ToolFailed(f"{response.status_code}: {reason}")
+            status = response.status_code
+            word = STATUS_WORDS.get(status) or ("upstream_error" if status >= 500 else "error")
+            raise ToolFailed(f"{status}: {word}")
         return response.json() if response.content else {"deleted": True}
 
     def add(r: Resource, operation: str, model: type[Strict], description: str, handler: Callable[[dict], Any]):
@@ -237,6 +283,7 @@ def build_server(cell: Cell, client: httpx.Client, token: Callable[[], str], *, 
         function.__name__ = name.replace(".", "_").replace("-", "_")
         server.argument_models[name] = model
         server.tool(name=name, description=description)(_with_signature(function, model))
+        _no_preparse(server, name)
 
     for r in cell.resources:
         models = argument_models(cell, r)
@@ -247,8 +294,10 @@ def build_server(cell: Cell, client: httpx.Client, token: Callable[[], str], *, 
             "list": (f"List {what} records in the caller's workspace, filtered by {', '.join(r.filters) or 'nothing'}.",
                      lambda a, base=base: call("GET", base, params=a)),
             "get": (f"Get one {what} by id.", lambda a, base=base: call("GET", f"{base}/{a['id']}")),
-            "create": (f"Create a {what}.", lambda a, base=base: call(
-                "POST", base, json=a, headers={"Idempotency-Key": f"mcp-{uuid.uuid4().hex}"})),
+            "create": (f"Create a {what}. Pass the same idempotency_key when retrying so a retry cannot duplicate.",
+                       lambda a, base=base: call(
+                           "POST", base, json={k: v for k, v in a.items() if k != "idempotency_key"},
+                           headers={"Idempotency-Key": a.get("idempotency_key") or f"mcp-{uuid.uuid4().hex}"})),
             "update": (f"Change fields of a {what}; pass expected_version to refuse a stale write.",
                        lambda a, base=base: call("PATCH", f"{base}/{a['id']}",
                                                  json={k: v for k, v in a.items() if k != "id"})),

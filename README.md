@@ -24,7 +24,7 @@ mkdir ../solo-goals && cp my-cell.yaml ../solo-goals/cell.yaml
 See `cellkit/spec.py` for the spec format, `cellkit/app.py` for the routes and
 `cellkit/contract.py` for what every cell proves in its own test run.
 
-## MCP server (kit 0.2.0)
+## MCP server (kit 0.2.1)
 
 Every cell gets its own MCP server (`cellkit/mcp.py`, vendored into `src/cellkit`):
 `cellkit-new <cell> --sync` adds the console script `<cell>-mcp` (stdio) and a
@@ -47,3 +47,12 @@ schemas from the resource's fields (list takes the declared `filters`, `limit`,
 
 After `--sync` in a cell: `uv pip install --python .venv/bin/python -e ".[dev]"`, then
 `.venv/bin/pytest -q`. Tests for the adapter are `tests/test_mcp.py` (fake httpx transport).
+
+Safety details: tool errors carry only the HTTP status and a fixed word (`403: forbidden`,
+`404: not_found`, `409: conflict`, `422: invalid`, `429: rate_limited`, `5xx: upstream_error`), never
+upstream text. Tokens with whitespace or control characters are refused. Fields named
+actor, actor_id, workspace, workspace_id, tenant, tenant_id, delegation, token, authorization or owner_id
+are not exposed as tool arguments (a warning is logged). `create` takes an optional `idempotency_key`
+(`^[A-Za-z0-9._:-]{8,128}$`, sent as `Idempotency-Key`); pass the same key when retrying a create.
+`--sync` merges `.mcp.json`: other servers and an `env` already set on this cell's entry are kept.
+`EMPIRE_MCP_AUTOMATION` must match `^[a-z0-9][a-z0-9-]{0,62}$`; the API URL may not carry userinfo, query or fragment.

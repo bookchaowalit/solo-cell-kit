@@ -172,3 +172,95 @@ def test_sync_writes_the_console_script_and_mcp_json():
         "mcpServers": {"demo-things": {"command": ".venv/bin/demo-things-mcp", "args": []}}}
     assert 'demo-things-mcp = "cellkit.mcp:main"' in (dest / "pyproject.toml").read_text()
     assert (dest / "src" / "cellkit" / "mcp.py").is_file()
+
+
+# --- review fixes (0.2.1) -----------------------------------------------------------------------
+
+def test_sync_keeps_env_and_other_servers_in_mcp_json():
+    from cellkit.new import generate
+
+    dest = Path(tempfile.mkdtemp(prefix="ck-mcpjson-"))
+    shutil.copy(ROOT / "examples" / "demo" / "cell.yaml", dest / "cell.yaml")
+    (dest / ".mcp.json").write_text(json.dumps({"mcpServers": {
+        "demo-things": {"command": "old", "args": ["x"], "env": {"EMPIRE_MCP_READONLY": "1"}},
+        "other": {"command": "other-server"}}}))
+    generate(dest, sync=True)
+    servers = json.loads((dest / ".mcp.json").read_text())["mcpServers"]
+    assert servers["demo-things"] == {"command": ".venv/bin/demo-things-mcp", "args": [],
+                                      "env": {"EMPIRE_MCP_READONLY": "1"}}
+    assert servers["other"] == {"command": "other-server"}
+
+
+def test_errors_never_carry_upstream_text():
+    secret = "S3CR3T-body"
+    for status, word in [(403, "forbidden"), (404, "not_found"), (409, "conflict"), (422, "invalid"),
+                         (429, "rate_limited"), (503, "upstream_error"), (418, "error")]:
+        for detail in ({"reason": secret}, {"error": {"nested": secret}}, secret):
+            with pytest.raises(ToolError) as caught:
+                call(server(Api(status, {"detail": detail, "message": secret})), "demo-things.board.get", {"id": 1})
+            assert str(caught.value).endswith(f"{status}: {word}") and secret not in str(caught.value)
+
+
+@pytest.mark.parametrize("bad", ["a b", "tok\nen", "tok\x00", "tök", "  "])
+def test_bad_tokens_fail_with_a_fixed_error_and_never_echo(bad):
+    with pytest.raises(mcp.ConfigError) as caught:
+        mcp.bearer({"EMPIRE_TOKEN": bad})
+    assert bad.strip() not in str(caught.value) or not bad.strip()
+    api = Api()
+    client = httpx.Client(base_url="https://demo.test", transport=httpx.MockTransport(api))
+    with pytest.raises(ToolError) as caught:
+        call(build_server(CELL, client, lambda: bad), "demo-things.board.get", {"id": 1})
+    assert bad.strip() not in str(caught.value) or not bad.strip()
+    assert api.requests == [] and caught.value.__cause__ is None or "Illegal header" not in repr(caught.value)
+
+
+def test_identity_named_fields_are_not_exposed():
+    from cellkit.spec import parse
+
+    cell = parse({"cell": "x", "resources": {"thing": {"filters": ["actor", "status"], "fields": {
+        "title": {"type": "text", "required": True}, "status": {"type": "text"},
+        "actor": {"type": "text"}, "workspace": {"type": "text"}, "token": {"type": "text"},
+        "owner_id": {"type": "int"}, "tenant": {"type": "text"}, "authorization": {"type": "text"}}}}})
+    with pytest.warns(UserWarning, match="identity-like"):
+        srv = build_server(cell, httpx.Client(base_url="https://x.test"), lambda: "t")
+    for tool in tools(srv).values():
+        assert not mcp.IDENTITY_NAMES & set(tool.input_schema["properties"]), tool.name
+    assert {"title", "status"} <= set(tools(srv)["x.thing.create"].input_schema["properties"])
+
+
+def test_create_idempotency_key():
+    api = Api(body={"id": 1})
+    srv = server(api)
+    call(srv, "demo-things.board.create", {"title": "t", "idempotency_key": "retry-key-0001"})
+    call(srv, "demo-things.board.create", {"title": "t"})
+    given, generated = api.requests
+    assert given.headers["idempotency-key"] == "retry-key-0001" and json.loads(given.content) == {"title": "t"}
+    assert generated.headers["idempotency-key"].startswith("mcp-")
+    for bad in ("short", "has space in it", "x" * 129):
+        with pytest.raises(ToolFailed, match="invalid_arguments: idempotency_key"):
+            call(srv, "demo-things.board.create", {"title": "t", "idempotency_key": bad})
+
+
+@pytest.mark.parametrize("url", ["https://u:p@a.test", "https://a.test?x=1", "https://a.test#f",
+                                 "https://a.test:99999", "https://a.test:abc", "ftp://a.test"])
+def test_api_url_rejects_userinfo_query_fragment_bad_port(url, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    with pytest.raises(mcp.ConfigError) as caught:
+        mcp.api_url("goals", {"EMPIRE_GOALS_API": url})
+    assert "u:p" not in str(caught.value)
+    assert mcp.api_url("goals", {"EMPIRE_GOALS_API": "https://a.test:8443/base"})
+
+
+@pytest.mark.parametrize("name", ["../x", "/abs/path", "A", "a/b", "a.b", "-a", "a" * 64, "a b"])
+def test_automation_name_is_restricted(name):
+    with pytest.raises(mcp.ConfigError, match="EMPIRE_MCP_AUTOMATION"):
+        mcp.bearer({"EMPIRE_MCP_AUTOMATION": name})
+
+
+def test_json_looking_text_passes():
+    api = Api(body={"id": 1})
+    srv = server(api)
+    call(srv, "demo-things.card.create", {"board_id": 1, "slug": "s", "note": "{}"})
+    call(srv, "demo-things.card.update", {"id": 1, "note": "[]"})
+    assert json.loads(api.requests[0].content)["note"] == "{}"
+    assert json.loads(api.requests[1].content) == {"note": "[]"}

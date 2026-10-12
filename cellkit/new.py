@@ -12,6 +12,7 @@ checksummed), so later schema changes are new hand-written migrations.
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -109,16 +110,6 @@ PACKAGE = """{{
 }}
 """
 
-MCP_JSON = """{{
-  "mcpServers": {{
-    "{name}": {{
-      "command": ".venv/bin/{name}-mcp",
-      "args": []
-    }}
-  }}
-}}
-"""
-
 GITIGNORE = ".venv/\n.runtime/\n__pycache__/\n*.egg-info/\n.env\n.env.*\n.pytest_cache/\nnode_modules/\n"
 DOCKERIGNORE = ".venv\n.runtime\n.git\ntests\nnode_modules\n**/__pycache__\n*.egg-info\n.env\n.env.*\n"
 
@@ -206,6 +197,21 @@ Railway variables: `{env}_DB_MODE=hosted`, `{env}_DB_URL_API`,
 """
 
 
+def write_mcp_json(path: Path, cell: Cell) -> None:
+    """Add or refresh this cell's server entry; keep other servers and any ``env`` already set on ours."""
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            raise SystemExit(f"{path} is not valid JSON; fix or remove it, then run --sync again") from None
+    servers = data.setdefault("mcpServers", {})
+    entry = dict(servers.get(cell.name) or {})
+    entry.update({"command": f".venv/bin/{cell.name}-mcp", "args": []})
+    servers[cell.name] = entry
+    write(path, json.dumps(data, indent=2) + "\n")
+
+
 def write(path: Path, text: str, *, keep: bool = False) -> None:
     if keep and path.exists():
         return
@@ -232,7 +238,7 @@ def generate(dest: Path, *, sync: bool = False) -> Cell:
     write(dest / ".dockerignore", DOCKERIGNORE)
     write(dest / "AGENTS.md", AGENTS.format(**fill))
     write(dest / "CLAUDE.md", "@AGENTS.md\n")
-    write(dest / ".mcp.json", MCP_JSON.format(**fill))
+    write_mcp_json(dest / ".mcp.json", cell)
     write(dest / "db" / "roles.sql", sqlgen.roles(cell))
     write(dest / "tests" / "conftest.py", CONFTEST, keep=True)
     write(dest / "tests" / "test_contract.py", CONTRACT, keep=True)
