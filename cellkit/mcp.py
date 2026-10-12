@@ -1,0 +1,281 @@
+"""MCP adapter for a cell: tools made from the cell's declared resources.
+
+Every tool calls the cell's HTTP API with the caller's own token, so MCP has
+exactly the authorization the API has: no tool reads the database, and no tool
+accepts an actor, workspace, delegation or token argument. Unknown arguments
+are rejected (strict pydantic models, ``extra="forbid"``), so a model cannot
+change who it acts as by adding fields to a tool call.
+
+Per resource ``<cell>.<resource>.<operation>``::
+
+    list    filters declared in the spec, limit, offset, order   GET    /v1/<plural>
+    get     id                                                   GET    /v1/<plural>/{id}
+    create  the resource's fields                                POST   /v1/<plural>
+    update  id, expected_version, the resource's fields          PATCH  /v1/<plural>/{id}
+    delete  id                                                   DELETE /v1/<plural>/{id}
+
+Configuration follows the other clients (solo-ops ``cell_store.py``, solo-mcp ``cell-store.ts``)::
+
+    EMPIRE_<CELL>_API=https://...        env, else the owner-only ~/.config/empire-platform/client.env
+    EMPIRE_TOKEN=...                     the bearer, else
+    EMPIRE_TOKEN_FILE=/path/x.jwt        a token file (mode 600), else the automation token
+    EMPIRE_MCP_AUTOMATION=owner-cli      EMPIRE_AUTOMATION_TOKEN_<NAME> or ~/.config/empire-platform/tokens/<name>.jwt
+    EMPIRE_MCP_READONLY=1                register only list and get
+
+    <cell>-mcp                           stdio server (see .mcp.json)
+"""
+
+from __future__ import annotations
+
+import contextvars
+import inspect
+import os
+import urllib.parse
+import uuid
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Literal
+
+import httpx
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import BaseModel, ConfigDict, Field as PydanticField, ValidationError, create_model
+
+from cellkit.app import _constraints, _python_type
+from cellkit.spec import Cell, Resource
+
+OPERATIONS = ("list", "get", "create", "update", "delete")
+READ_ONLY = ("list", "get")
+LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+MAX_LIMIT = 200
+
+
+# The arguments exactly as the caller sent them: the framework fills defaults, but "unset" and "null" differ.
+sent: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("sent", default={})
+
+
+class Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ToolFailed(ToolError):
+    """Reaches the MCP client as a tool error carrying only the API's error code."""
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+# --- configuration ------------------------------------------------------------------------------
+
+def api_key(cell: str) -> str:
+    return f"EMPIRE_{cell.upper().replace('-', '_')}_API"
+
+
+def _client_file(environ: Any) -> dict[str, str]:
+    override = (environ.get("EMPIRE_CLIENT_CONFIG") or "").strip()
+    path = Path(override).expanduser() if override else Path.home() / ".config" / "empire-platform" / "client.env"
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        return {}
+    if mode & 0o077:
+        raise ConfigError(f"refusing client config {path}: group/world accessible; run chmod 600")
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def api_url(cell: str, environ: Any = None) -> str:
+    environ = os.environ if environ is None else environ
+    key = api_key(cell)
+    value = (environ.get(key) or "").strip() or _client_file(environ).get(key, "")
+    if not value:
+        raise ConfigError(f"the {cell} API is not configured: set {key} (env or client.env)")
+    parts = urllib.parse.urlsplit(value)
+    host = (parts.hostname or "").lower()
+    if not (parts.scheme == "https" and host) and not (parts.scheme == "http" and host in LOOPBACK):
+        raise ConfigError(f"{key} must be https (http only for 127.0.0.1, ::1 or localhost)")
+    return value
+
+
+def _read_token_file(path: Path) -> str:
+    if path.stat().st_mode & 0o077:
+        raise ConfigError(f"token file {path} must be readable by its owner only (chmod 600)")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def bearer(environ: Any = None) -> str:
+    """The caller's own token: EMPIRE_TOKEN, EMPIRE_TOKEN_FILE, else the named automation token."""
+    environ = os.environ if environ is None else environ
+    if environ.get("EMPIRE_TOKEN"):
+        return environ["EMPIRE_TOKEN"].strip()
+    if environ.get("EMPIRE_TOKEN_FILE"):
+        return _read_token_file(Path(environ["EMPIRE_TOKEN_FILE"]).expanduser())
+    name = environ.get("EMPIRE_MCP_AUTOMATION") or "owner-cli"
+    key = "EMPIRE_AUTOMATION_TOKEN_" + name.upper().replace("-", "_")
+    if environ.get(key):
+        return environ[key].strip()
+    path = Path.home() / ".config" / "empire-platform" / "tokens" / f"{name}.jwt"
+    if path.is_file():
+        return _read_token_file(path)
+    raise ConfigError(f"no token: set EMPIRE_TOKEN, EMPIRE_TOKEN_FILE or {key}")
+
+
+# --- argument models from the spec ----------------------------------------------------------------
+
+def argument_models(cell: Cell, r: Resource) -> dict[str, type[Strict]]:
+    """Strict argument model per operation, derived from the resource's fields."""
+    name = "".join(part.title() for part in r.name.split("-"))
+    cfg = {"__base__": Strict}
+
+    def typed(f, *, required: bool):
+        typ, extra = _python_type(f), _constraints(f)
+        if required:
+            return (typ, PydanticField(**extra))
+        return (typ | None, PydanticField(default=None, **extra))
+
+    list_fields: dict[str, Any] = {
+        **{f.name: typed(f, required=False) for f in r.fields if f.name in r.filters and f.name not in ("limit", "offset", "order")},
+        "limit": (int, PydanticField(default=50, ge=1, le=MAX_LIMIT)),
+        "offset": (int, PydanticField(default=0, ge=0)),
+        "order": (Literal["asc", "desc"], PydanticField(default="asc")),
+    }
+    ident = {"id": (int, PydanticField(gt=0))}
+    return {
+        "list": create_model(f"{name}List", **cfg, **list_fields),
+        "get": create_model(f"{name}Ref", **cfg, **ident),
+        "create": create_model(f"{name}Create", **cfg, **{
+            f.name: typed(f, required=f.required and f.default is None) for f in r.fields}),
+        "update": create_model(f"{name}Update", **cfg, **ident,
+                               expected_version=(int | None, PydanticField(default=None, ge=1)),
+                               **{f.name: typed(f, required=False) for f in r.fields}),
+        "delete": create_model(f"{name}Delete", **cfg, **ident),
+    }
+
+
+def tool_name(cell: Cell, r: Resource, operation: str) -> str:
+    return f"{cell.name}.{r.name}.{operation}"
+
+
+# --- the server ----------------------------------------------------------------------------------
+
+class StrictMCPServer(MCPServer):
+    """MCPServer that validates arguments against a strict model before any tool runs."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.argument_models: dict[str, type[Strict]] = {}
+
+    async def list_tools(self):  # type: ignore[override]
+        tools = await super().list_tools()
+        for tool in tools:
+            model = self.argument_models.get(tool.name)
+            if model is not None:
+                tool.input_schema = {**model.model_json_schema(), "additionalProperties": False}
+        return tools
+
+    async def call_tool(self, name: str, arguments: dict[str, Any], context: Any = None):  # type: ignore[override]
+        model = self.argument_models.get(name)
+        if model is None:
+            raise ToolFailed(f"unknown tool {name}")
+        try:
+            model.model_validate(arguments or {})
+        except ValidationError as exc:
+            fields = sorted({str(error["loc"][0]) for error in exc.errors() if error["loc"]})
+            raise ToolFailed(f"invalid_arguments: {', '.join(fields)}") from exc
+        token = sent.set(dict(arguments or {}))
+        try:
+            return await super().call_tool(name, arguments, context)
+        finally:
+            sent.reset(token)
+
+
+def _with_signature(function: Callable[..., Any], model: type[Strict]) -> Callable[..., Any]:
+    """Give ``function`` the model's fields as its keyword parameters (what the server introspects)."""
+    params = []
+    for fname, info in model.model_fields.items():
+        default = inspect.Parameter.empty if info.is_required() else info.default
+        params.append(inspect.Parameter(fname, inspect.Parameter.KEYWORD_ONLY, default=default,
+                                        annotation=info.annotation))
+    function.__signature__ = inspect.Signature(params)  # type: ignore[attr-defined]
+    function.__annotations__ = {p.name: p.annotation for p in params}
+    return function
+
+
+def build_server(cell: Cell, client: httpx.Client, token: Callable[[], str], *, read_only: bool = False,
+                 server: StrictMCPServer | None = None) -> StrictMCPServer:
+    """Register ``<cell>.<resource>.<operation>`` tools; ``client`` is the cell API (base_url set)."""
+    if server is None:
+        server = StrictMCPServer(cell.name, instructions=(
+            f"Solo Empire {cell.title} cell. Every tool calls the cell API as the authenticated caller only."))
+
+    def call(method: str, path: str, **kwargs: Any) -> Any:
+        headers = {"Authorization": f"Bearer {token()}", "X-Empire-Channel": "mcp",
+                   "X-Correlation-Id": f"mcp-{uuid.uuid4().hex}", **kwargs.pop("headers", {})}
+        response = client.request(method, path, headers=headers, **kwargs)
+        if response.status_code >= 400:
+            detail = response.json().get("detail") if response.headers.get(
+                "content-type", "").startswith("application/json") else None
+            reason = (detail.get("reason") or detail.get("error")) if isinstance(detail, dict) else "error"
+            raise ToolFailed(f"{response.status_code}: {reason}")
+        return response.json() if response.content else {"deleted": True}
+
+    def add(r: Resource, operation: str, model: type[Strict], description: str, handler: Callable[[dict], Any]):
+        name = tool_name(cell, r, operation)
+
+        def function(**kwargs: Any) -> Any:
+            checked = model.model_validate(sent.get())
+            # list drops unset filters; the others send exactly what the caller set (null clears a field).
+            return handler(checked.model_dump(mode="json", **({"exclude_none": True} if operation == "list"
+                                                              else {"exclude_unset": True})))
+
+        function.__name__ = name.replace(".", "_").replace("-", "_")
+        server.argument_models[name] = model
+        server.tool(name=name, description=description)(_with_signature(function, model))
+
+    for r in cell.resources:
+        models = argument_models(cell, r)
+        base = f"/v1/{r.plural}"
+        what = r.name.replace("-", " ")
+        operations = READ_ONLY if read_only else OPERATIONS
+        handlers: dict[str, tuple[str, Callable[[dict], Any]]] = {
+            "list": (f"List {what} records in the caller's workspace, filtered by {', '.join(r.filters) or 'nothing'}.",
+                     lambda a, base=base: call("GET", base, params=a)),
+            "get": (f"Get one {what} by id.", lambda a, base=base: call("GET", f"{base}/{a['id']}")),
+            "create": (f"Create a {what}.", lambda a, base=base: call(
+                "POST", base, json=a, headers={"Idempotency-Key": f"mcp-{uuid.uuid4().hex}"})),
+            "update": (f"Change fields of a {what}; pass expected_version to refuse a stale write.",
+                       lambda a, base=base: call("PATCH", f"{base}/{a['id']}",
+                                                 json={k: v for k, v in a.items() if k != "id"})),
+            "delete": (f"Delete a {what} by id (refused while other records reference it).",
+                       lambda a, base=base: call("DELETE", f"{base}/{a['id']}")),
+        }
+        for operation in operations:
+            description, handler = handlers[operation]
+            add(r, operation, models[operation], description, handler)
+    return server
+
+
+def find_cell() -> Cell:
+    from cellkit.spec import load
+
+    for root in (os.environ.get("CELL_APP_ROOT"), Path.cwd(), Path(__file__).resolve().parents[2]):
+        if root and (Path(root) / "cell.yaml").is_file():
+            return load(Path(root) / "cell.yaml")
+    raise SystemExit("cell.yaml not found: run from the cell repository or set CELL_APP_ROOT")
+
+
+def main() -> None:
+    cell = find_cell()
+    try:
+        url, _ = api_url(cell.name), bearer()
+    except ConfigError as exc:
+        raise SystemExit(str(exc)) from None
+    client = httpx.Client(base_url=url, timeout=30, follow_redirects=False)
+    server = build_server(cell, client, bearer, read_only=os.environ.get("EMPIRE_MCP_READONLY") == "1")
+    server.run("stdio")

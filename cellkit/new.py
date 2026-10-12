@@ -37,9 +37,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pgserver>=0.1.4"]
+mcp = ["mcp>=2.3,<3"]
+dev = ["pytest>=8", "pgserver>=0.1.4", "mcp>=2.3,<3"]
 
 [project.scripts]
+{name}-mcp = "cellkit.mcp:main"
 {name}-api = "cellkit.server:api"
 {name}-publish = "cellkit.server:run_publish"
 {name}-db = "cellkit.server:run_db"
@@ -107,6 +109,16 @@ PACKAGE = """{{
 }}
 """
 
+MCP_JSON = """{{
+  "mcpServers": {{
+    "{name}": {{
+      "command": ".venv/bin/{name}-mcp",
+      "args": []
+    }}
+  }}
+}}
+"""
+
 GITIGNORE = ".venv/\n.runtime/\n__pycache__/\n*.egg-info/\n.env\n.env.*\n.pytest_cache/\nnode_modules/\n"
 DOCKERIGNORE = ".venv\n.runtime\n.git\ntests\nnode_modules\n**/__pycache__\n*.egg-info\n.env\n.env.*\n"
 
@@ -121,6 +133,9 @@ AGENTS = """# Agent Instructions
   an applied file, add a new numbered one.
 - `src/cellkit` is vendored from solo-cell-kit: change it there, then run
   `cellkit-new . --sync` here. Cell-specific code lives in `src/solo_{schema}/`.
+- `{name}-mcp` (stdio, see `.mcp.json`) is this cell's MCP server: tools `{name}.<resource>.list|get|create|update|delete`
+  call the cell API with the caller's token (`EMPIRE_TOKEN`, `EMPIRE_TOKEN_FILE` or the `owner-cli` automation token;
+  URL from `EMPIRE_{env}_API`). Set `EMPIRE_MCP_READONLY=1` for list/get only. Never add actor, workspace or token arguments.
 - Deploys are manual (`railway up`) and change production; verify `/health` and one
   authorized read afterwards.
 - Keep the solo-empire registry entry (`{name}` in
@@ -204,7 +219,7 @@ def generate(dest: Path, *, sync: bool = False) -> Cell:
     if vendored.exists():
         shutil.rmtree(vendored)
     shutil.copytree(KIT, vendored, ignore=shutil.ignore_patterns("__pycache__", "new.py"))
-    fill = {"name": cell.name, "title": cell.title, "schema": cell.schema}
+    fill = {"name": cell.name, "title": cell.title, "schema": cell.schema, "env": cell.env}
     write(dest / "pyproject.toml", PYPROJECT.format(**fill))
     write(dest / "Dockerfile", DOCKERFILE.format(**fill))
     write(dest / ".railway" / "railway.ts", RAILWAY.format(
@@ -217,6 +232,7 @@ def generate(dest: Path, *, sync: bool = False) -> Cell:
     write(dest / ".dockerignore", DOCKERIGNORE)
     write(dest / "AGENTS.md", AGENTS.format(**fill))
     write(dest / "CLAUDE.md", "@AGENTS.md\n")
+    write(dest / ".mcp.json", MCP_JSON.format(**fill))
     write(dest / "db" / "roles.sql", sqlgen.roles(cell))
     write(dest / "tests" / "conftest.py", CONFTEST, keep=True)
     write(dest / "tests" / "test_contract.py", CONTRACT, keep=True)
