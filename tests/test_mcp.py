@@ -141,7 +141,7 @@ def test_token_sources(tmp_path, monkeypatch):
     file.chmod(0o644)
     with pytest.raises(mcp.ConfigError, match="owner only"):
         mcp.bearer({"EMPIRE_TOKEN_FILE": str(file)})
-    assert mcp.bearer({"EMPIRE_AUTOMATION_TOKEN_OWNER_CLI": "c"}) == "c"
+    assert mcp.bearer({"EMPIRE_AUTOMATION_TOKEN_OWNER_MCP": "c"}) == "c"
     assert mcp.bearer({"EMPIRE_MCP_AUTOMATION": "x-y", "EMPIRE_AUTOMATION_TOKEN_X_Y": "d"}) == "d"
     with pytest.raises(mcp.ConfigError, match="no token"):
         mcp.bearer({})
