@@ -39,7 +39,7 @@ schemas from the resource's fields (list takes the declared `filters`, `limit`,
 - URL: `EMPIRE_<CELL>_API` (env or `~/.config/empire-platform/client.env`), the same
   as solo-ops `cell_store.py` and solo-mcp `cell-store.ts`.
 - Token: `EMPIRE_TOKEN`, else `EMPIRE_TOKEN_FILE` (mode 600), else the automation named
-  by `EMPIRE_MCP_AUTOMATION` (default `owner-cli`): `EMPIRE_AUTOMATION_TOKEN_<NAME>` or
+  by `EMPIRE_MCP_AUTOMATION` (default `owner-mcp`, a dedicated automation with read and write on every cell but no delete or approve): `EMPIRE_AUTOMATION_TOKEN_<NAME>` or
   `~/.config/empire-platform/tokens/<name>.jwt`.
 - `EMPIRE_MCP_READONLY=1` registers only `list` and `get`.
 - The `mcp` library (`mcp>=2.3,<3`, as empire-mcp) is in the cell's `dev` and `mcp` extras,

@@ -1,6 +1,6 @@
 [project]
 name = "solo-cell-kit"
-version = "0.2.2"
+version = "0.2.3"
 description = "Make a Solo Empire cell (its own API, database, platform write path and deploy) from a cell.yaml"
 requires-python = ">=3.12"
 dependencies = [

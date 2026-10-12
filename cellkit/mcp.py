@@ -19,7 +19,7 @@ Configuration follows the other clients (solo-ops ``cell_store.py``, solo-mcp ``
     EMPIRE_<CELL>_API=https://...        env, else the owner-only ~/.config/empire-platform/client.env
     EMPIRE_TOKEN=...                     the bearer, else
     EMPIRE_TOKEN_FILE=/path/x.jwt        a token file (mode 600), else the automation token
-    EMPIRE_MCP_AUTOMATION=owner-cli      EMPIRE_AUTOMATION_TOKEN_<NAME> or ~/.config/empire-platform/tokens/<name>.jwt
+    EMPIRE_MCP_AUTOMATION=owner-mcp      EMPIRE_AUTOMATION_TOKEN_<NAME> or ~/.config/empire-platform/tokens/<name>.jwt
     EMPIRE_MCP_READONLY=1                register only list and get
 
     <cell>-mcp                           stdio server (see .mcp.json)
@@ -140,7 +140,7 @@ def bearer(environ: Any = None) -> str:
         return _checked(environ["EMPIRE_TOKEN"])
     if environ.get("EMPIRE_TOKEN_FILE"):
         return _checked(_read_token_file(Path(environ["EMPIRE_TOKEN_FILE"]).expanduser()))
-    name = environ.get("EMPIRE_MCP_AUTOMATION") or "owner-cli"
+    name = environ.get("EMPIRE_MCP_AUTOMATION") or "owner-mcp"
     if not AUTOMATION.match(name):
         raise ConfigError("EMPIRE_MCP_AUTOMATION must be a short lowercase name (letters, digits, '-')")
     key = "EMPIRE_AUTOMATION_TOKEN_" + name.upper().replace("-", "_")
