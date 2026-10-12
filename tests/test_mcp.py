@@ -264,3 +264,32 @@ def test_json_looking_text_passes():
     call(srv, "demo-things.card.update", {"id": 1, "note": "[]"})
     assert json.loads(api.requests[0].content)["note"] == "{}"
     assert json.loads(api.requests[1].content) == {"note": "[]"}
+
+
+def test_resource_owning_an_idempotency_key_field_builds_and_sends_it():
+    from cellkit.spec import parse
+
+    cell = parse({"cell": "x", "resources": {"item": {"fields": {
+        "title": {"type": "text", "required": True}, "idempotency_key": {"type": "text"}}}}})
+    api = Api(body={"id": 1})
+    srv = build_server(cell, httpx.Client(base_url="https://x.test", transport=httpx.MockTransport(api)), lambda: "t")
+    call(srv, "x.item.create", {"title": "t", "idempotency_key": "own-key-0001"})
+    (request,) = api.requests
+    assert json.loads(request.content) == {"title": "t", "idempotency_key": "own-key-0001"}
+    assert request.headers["idempotency-key"] == "own-key-0001"
+
+
+def test_sync_keeps_cell_customised_files():
+    from cellkit.new import generate
+
+    dest = Path(tempfile.mkdtemp(prefix="ck-keep-"))
+    shutil.copy(ROOT / "examples" / "demo" / "cell.yaml", dest / "cell.yaml")
+    custom = {".railway/railway.ts": "// custom service\n", ".gitignore": "custom\n",
+              ".dockerignore": "custom\n", "Dockerfile": "FROM custom\n", "package.json": "{\"custom\": true}\n"}
+    for name, text in custom.items():
+        (dest / name).parent.mkdir(parents=True, exist_ok=True)
+        (dest / name).write_text(text)
+    generate(dest, sync=True)
+    for name, text in custom.items():
+        assert (dest / name).read_text() == text, name
+    assert (dest / "src" / "cellkit" / "mcp.py").exists() and (dest / ".mcp.json").exists()

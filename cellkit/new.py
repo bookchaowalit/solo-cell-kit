@@ -220,6 +220,8 @@ def write(path: Path, text: str, *, keep: bool = False) -> None:
 
 
 def generate(dest: Path, *, sync: bool = False) -> Cell:
+    # On --sync, files a cell may customise (deploy config, ignore files, Dockerfile, package.json) are kept;
+    # the vendored kit, pyproject wiring, AGENTS.md and .mcp.json are refreshed.
     cell = load(dest / "cell.yaml")
     vendored = dest / "src" / "cellkit"
     if vendored.exists():
@@ -227,15 +229,15 @@ def generate(dest: Path, *, sync: bool = False) -> Cell:
     shutil.copytree(KIT, vendored, ignore=shutil.ignore_patterns("__pycache__", "new.py"))
     fill = {"name": cell.name, "title": cell.title, "schema": cell.schema, "env": cell.env}
     write(dest / "pyproject.toml", PYPROJECT.format(**fill))
-    write(dest / "Dockerfile", DOCKERFILE.format(**fill))
+    write(dest / "Dockerfile", DOCKERFILE.format(**fill), keep=sync)
     write(dest / ".railway" / "railway.ts", RAILWAY.format(
         **fill, publisher=PUBLISHER.format(**fill) if cell.graph else "",
         publisher_note=(f"\n// {cell.name}-publisher is a cron sweep of the outbox that exits after each run."
                         if cell.graph else ""),
-        resources="api, publisher" if cell.graph else "api"))
-    write(dest / "package.json", PACKAGE.format(**fill))
-    write(dest / ".gitignore", GITIGNORE)
-    write(dest / ".dockerignore", DOCKERIGNORE)
+        resources="api, publisher" if cell.graph else "api"), keep=sync)
+    write(dest / "package.json", PACKAGE.format(**fill), keep=sync)
+    write(dest / ".gitignore", GITIGNORE, keep=sync)
+    write(dest / ".dockerignore", DOCKERIGNORE, keep=sync)
     write(dest / "AGENTS.md", AGENTS.format(**fill))
     write(dest / "CLAUDE.md", "@AGENTS.md\n")
     write_mcp_json(dest / ".mcp.json", cell)

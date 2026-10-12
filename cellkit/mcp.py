@@ -182,7 +182,10 @@ def argument_models(cell: Cell, r: Resource) -> dict[str, type[Strict]]:
         "get": create_model(f"{name}Ref", **cfg, **ident),
         "create": create_model(f"{name}Create", **cfg, **{
             f.name: typed(f, required=f.required and f.default is None) for f in exposed},
-                             idempotency_key=(str | None, PydanticField(default=None, pattern=IDEMPOTENCY_KEY))),
+                             # A resource may already own a field called idempotency_key (it is then sent in the
+                             # body and reused as the header); otherwise the tool adds an optional retry key.
+                             **({} if any(f.name == "idempotency_key" for f in exposed) else {
+                                 "idempotency_key": (str | None, PydanticField(default=None, pattern=IDEMPOTENCY_KEY))})),
         "update": create_model(f"{name}Update", **cfg, **ident,
                                expected_version=(int | None, PydanticField(default=None, ge=1)),
                                **{f.name: typed(f, required=False) for f in exposed}),
@@ -295,8 +298,8 @@ def build_server(cell: Cell, client: httpx.Client, token: Callable[[], str], *, 
                      lambda a, base=base: call("GET", base, params=a)),
             "get": (f"Get one {what} by id.", lambda a, base=base: call("GET", f"{base}/{a['id']}")),
             "create": (f"Create a {what}. Pass the same idempotency_key when retrying so a retry cannot duplicate.",
-                       lambda a, base=base: call(
-                           "POST", base, json={k: v for k, v in a.items() if k != "idempotency_key"},
+                       lambda a, base=base, own=any(f.name == "idempotency_key" for f in r.fields): call(
+                           "POST", base, json={k: v for k, v in a.items() if own or k != "idempotency_key"},
                            headers={"Idempotency-Key": a.get("idempotency_key") or f"mcp-{uuid.uuid4().hex}"})),
             "update": (f"Change fields of a {what}; pass expected_version to refuse a stale write.",
                        lambda a, base=base: call("PATCH", f"{base}/{a['id']}",
